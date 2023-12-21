@@ -1,8 +1,20 @@
+use std::io::Error;
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::{env, process};
 
-pub struct Connection;
+pub struct Stream {
+    variants: StreamVariants,
+    open: bool,
+}
+pub enum StreamVariants {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+pub struct Connection {
+    stream: Stream,
+}
 
 #[derive(Debug)]
 struct XConf {
@@ -32,41 +44,61 @@ fn parse_conf(display_name: String) -> XConf {
     conf
 }
 
+// Connects to the X11 server using socket path
+fn connect_unix_socket(socket_path: &str) -> std::io::Result<Stream> {
+    match UnixStream::connect(socket_path) {
+        Ok(stream) => Ok(Stream {
+            variants: StreamVariants::Unix(stream),
+            open: true,
+        }),
+        Err(err) => {
+            println!("Could not establish socket connection: {}", err);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Could not establish socket connection",
+            ))
+        }
+    }
+}
+
+// Connect to the X11  server via Tcp
+fn connect_tcp(host: &str, port: &u16) -> std::io::Result<Stream> {
+    let addr: String = format!("{}:{}", host, port);
+    println!("addr: {}", addr);
+    match TcpStream::connect(addr) {
+        Ok(stream) => Ok(Stream {
+            variants: StreamVariants::Tcp(stream),
+            open: true,
+        }),
+        Err(e) => {
+            eprintln!("Could not establish connection: {}", e);
+            process::exit(0);
+        }
+    }
+}
+
 // Opens a connection using the Unix domain sockets or over TCP
 // Typically TCP connections are used for connecting to remote X11 server.
 // So that we will first attempt to connect through Unix sockets.
 // If that is unsuccessful, connect via TCP.
-fn open(display_name: String) {
-    // Parse address
-    let conf = parse_conf(display_name);
+fn open(display_name: String) -> Result<Connection, Error> {
+    let XConf {
+        socket_path,
+        port,
+        host,
+        ..
+    } = &parse_conf(display_name);
 
-    let mut connected: bool = false;
-    let mut _stream;
-
-    match UnixStream::connect(conf.socket_path) {
-        Ok(_stream) => {
-            connected = true;
-            // Stream::Unix(Box::new(stream))
-            // TODO: Handle stream
-        }
-        Err(err) => println!("Could not establish socket connection: {}", err),
+    // TODO: connect using abstract unix streams first
+    let stream = match connect_unix_socket(socket_path) {
+        Ok(stream) if stream.open => stream,
+        _ => connect_tcp(host, port)?,
     };
-
-    if !connected {
-        let addr: String = format!("{}:{}", conf.host, conf.port);
-        println!("addr: {}", addr);
-        _stream = match TcpStream::connect(addr) {
-            Ok(stream) => stream,
-            Err(e) => {
-                eprintln!("Could not establish connection: {}", e);
-                process::exit(0);
-            }
-        };
-    }
+    Ok(Connection { stream })
 }
 
 impl Connection {
-    pub fn init() {
+    pub fn init() -> Result<Connection, Error> {
         let display_name = match env::var("DISPLAY") {
             Ok(value) => value,
             Err(env::VarError::NotPresent) => {
@@ -80,7 +112,15 @@ impl Connection {
         };
 
         // Opens a connection
-        open(display_name)
+        let conn = open(display_name)?;
+
+        // TODO: Authenticate
+
+        // Write
+
+        // Read
+
+        Ok(conn)
     }
 }
 
