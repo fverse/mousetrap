@@ -20,13 +20,18 @@ pub struct XAuthEntry {
 }
 
 impl XAuthEntry {
+
     /// Parse the .Xauthority file
     pub fn parse() -> io::Result<Vec<XAuthEntry>> {
+        
         // Open .Xauthority file
         let xauth_file = open()?;
         let mut reader = io::BufReader::new(xauth_file);
         let mut xauth_entries = Vec::new();
 
+        /// Reads 2 bytes from the provided reader and returns them as a u16 value. 
+        /// Used to read length fields (i.e. 2-byte values) that precede data 
+        /// sections in the .Xauthority file.
         fn read_preceding_bytes<R: Read>(reader: &mut R) -> io::Result<u16> {
             let mut buf = [0u8; 2];
             match reader.read_exact(&mut buf) {
@@ -35,6 +40,10 @@ impl XAuthEntry {
             }
         }
 
+        /// Calls read_preceding_bytes to first determine the length of the subsequent 
+        /// data section, then reads that many bytes. 
+        /// Used for reading variable-length data like address, display number, 
+        /// authorization name, and authorization data.
         fn read_subsequent_bytes<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
             let len = read_preceding_bytes(reader)? as usize;
             let mut buf = vec![0u8; len];
@@ -44,20 +53,20 @@ impl XAuthEntry {
             }
         }
 
+        /// Reads a single entry from the .Xauthority file.
+        //
+        //  The sequence of entries in the .Xauthority file is in the following order:
+        //    2 bytes	Family value (second byte is as in protocol HOST)
+        //    2 bytes	address length (always MSB first)
+        //    A bytes	host address (as in protocol HOST)
+        //    2 bytes	display "number" length (always MSB first)
+        //    S bytes    display "number" string
+        //    2 bytes	name length (always MSB first)
+        //    N bytes	authorization name string
+        //    2 bytes	data length (always MSB first)
+        //    D bytes	authorization data string
         fn read_xauth_entry<R: Read>(reader: &mut R) -> std::io::Result<XAuthEntry> {
-            /*
-            The sequence of entries in the .Xauthority file is in the following order:
-             2 bytes	Family value (second byte is as in protocol HOST)
-             2 bytes	address length (always MSB first)
-             A bytes	host address (as in protocol HOST)
-             2 bytes	display "number" length (always MSB first)
-             S bytes    display "number" string
-             2 bytes	name length (always MSB first)
-             N bytes	authorization name string
-             2 bytes	data length (always MSB first)
-             D bytes	authorization data string
-            */
-
+          
             let family = read_preceding_bytes(reader)?;
             let address = read_subsequent_bytes(reader)?;
             let display_number = read_subsequent_bytes(reader)?;
@@ -79,7 +88,6 @@ impl XAuthEntry {
         Ok(xauth_entries)
     }
 
-    pub fn get_auth_info() {}
 }
 
 /// Get XAUTHORITY file path

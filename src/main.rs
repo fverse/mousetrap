@@ -1,6 +1,9 @@
 mod connection;
 mod auth;
 mod byteorder;
+mod utils;
+mod errors;
+mod proto;
 
 use connection::Connection;
 

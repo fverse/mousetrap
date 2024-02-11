@@ -1,9 +1,12 @@
 use super::auth::XAuthEntry;
 use crate::byteorder::BYTE_ORDER;
+use crate::errors::{ConnectionError, ParseError};
+use crate::utils::{deserialize_into, deserialize_into_string};
 use std::io::{self, Error, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
-use std::{env, fs, mem, process, ptr, slice};
+use std::time::Duration;
+use std::{env, mem, process, slice};
 
 /// Order of bits within the bytes for a Bitmap image.
 pub enum BitOrder {
@@ -130,7 +133,8 @@ pub struct ConnSetupRequest {
 }
 
 /// Represents the response received from the x11 server if the connection is accepted.
-pub struct ConnSetupResponse {
+pub struct ConnSetup {
+    success: u8,
     /// Major protocol version supported by the server.
     protocol_major_version: u16,
     /// Minor protocol version supported by the  server.
@@ -164,7 +168,9 @@ pub struct ConnSetupResponse {
 }
 
 /// Represents the response received from the x11 server if the connection is refused.
-pub struct Failed {
+pub struct ConnFailed {
+    /// The connection status
+    status: u8,
     /// Major and minor protocol version supported by the server.
     protocol_major_version: u8,
     protocol_minor_version: u8,
@@ -189,14 +195,8 @@ pub struct Connection {
     stream: Stream,
 }
 
-/// Represents errors that can occur while attempting to establish a connection.
-///
-/// This enum is used to categorize the different types of connection errors
-/// and provide more specific information about what went wrong during the
-/// connection process.
-pub enum ConnectionError {
-    InvalidSocketPath,
-    ConnectionRefused,
+pub struct ConnSetupResponse {
+    buffer: Vec<u8>,
 }
 
 // Basic config variables for the x11 connection.
@@ -229,6 +229,7 @@ fn parse_conf(display_name: String) -> XConf {
 }
 
 impl ConnSetupRequest {
+    /// Creates an instance of `ConnSetupRequest`
     pub fn new(entry: XAuthEntry) -> Self {
         Self {
             byte_order: BYTE_ORDER,
@@ -239,21 +240,135 @@ impl ConnSetupRequest {
         }
     }
 
+    /// Returns the raw bytes from a `ConnSetupRequest`
     fn byte_raw_slice(v: &Self) -> &[u8] {
         let p: *const Self = v;
         let p: *const u8 = p as *const u8;
         unsafe { slice::from_raw_parts(p, mem::size_of_val(v)) }
     }
 
-    pub fn serialize(&self) -> &[u8] {
-        let s: &[u8] = Self::byte_raw_slice(self);
-        println!("slice: {:?}", s);
-        s
+    /// Converts an instance of `ConnSetupRequest` to x11 raw bytes
+    //
+    //  The connection setup request payload should be as follows:
+    //   1 byte     Byte Order
+    //   1 byte     Unused (Padding, for alignment)
+    //   2 bytes    Protocol Major Version
+    //   2 bytes    Protocol Minor Version
+    //   2 bytes    Authorization protocol name length
+    //   2 bytes    Authorization protocol data length
+    //   2 bytes    Unused (Padding, for alignment)
+    //   N bytes    Authorization protocol name
+    //   P bytes    Unused (P = pad(N): To align the authorization protocol name to a 4-byte boundary)
+    //   D bytes    Authorization protocol data
+    //   Q bytes    Unused (Q = pad(D): To align the authorization protocol data to a 4-byte boundary)
+    //
+    //  TODO: think about rewriting the function to reduce code duplication.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut payload: Vec<u8> = Vec::new();
+
+        // Byte Order: 1 byte
+        payload.extend_from_slice(&self.byte_order.to_ne_bytes());
+
+        // Padding: 1 byte (For alignment. Unused)
+        payload.extend_from_slice(&[0; 1]);
+
+        // Protocol Major Version: 2 bytes
+        payload.extend_from_slice(&self.protocol_major_version.to_ne_bytes());
+
+        //  Protocol Minor Version: 2 bytes
+        payload.extend_from_slice(&self.protocol_minor_version.to_ne_bytes());
+
+        // Authorization protocol name length: 2 bytes
+        payload.extend_from_slice(
+            &u16::try_from(self.authorization_protocol_name.len())
+                .unwrap()
+                .to_ne_bytes(),
+        );
+
+        // Authorization protocol data length: 2 bytes
+        payload.extend_from_slice(
+            &u16::try_from(self.authorization_protocol_data.len())
+                .unwrap()
+                .to_ne_bytes(),
+        );
+
+        // Padding: 2 bytes (For alignment. Unused)
+        payload.extend_from_slice(&[0; 2]);
+
+        // Authorization Protocol name: N bytes
+        payload.extend_from_slice(&self.authorization_protocol_name);
+
+        // Padding: (To align the authorization protocol name to a 4-byte boundary. Unused)
+        payload.extend_from_slice(&[0; 3][..(4 - (payload.len() % 4)) % 4]);
+
+        // Authorization Protocol data: D bytes
+        payload.extend_from_slice(&self.authorization_protocol_data);
+
+        // Padding: (To align the authorization protocol name to a 4-byte boundary. Unused)
+        payload.extend_from_slice(&[0; 3][..(4 - (payload.len() % 4)) % 4]);
+        payload
+    }
+}
+
+
+impl ConnSetup {
+    pub fn parse_into(bytes: &[u8]) -> Result<ConnSetup, ConnectionError> {
+        match bytes.get(0) {
+            Some(0) => {
+                // Connection failed
+                // TODO: parse to ConnFailed
+                Err(ConnectionError::ConnectionRefused)
+            }
+            Some(1) => {
+                // Connection established
+                // TODO: instead of unwrap, use ?
+                return Ok(Self::from_bytes(bytes).unwrap());
+            }
+            Some(2) => {
+                // Further authentication required
+                // TODO: parse to AuthRequired
+                Err(ConnectionError::FurtherAuthenticationRequired)
+            }
+            _ => Err(ConnectionError::InvalidResponseFromServer),
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<ConnSetup, ParseError> {
+        let (success, rest) = deserialize_into::<u8>(bytes)?;
+
+        // Trim the unused 1 byte
+        let rest = &rest[1..];
+        let (protocol_major_version, rest) = deserialize_into::<u16>(rest)?;
+        let (protocol_minor_version, rest) = deserialize_into::<u16>(rest)?;
+
+        // 8+2n+(v+p+m)/4 : length in 4-byte units of "additional data"
+        let (ln, rest) = deserialize_into::<u16>(rest)?;
+        let (release_number, rest) = deserialize_into::<u32>(rest)?;
+        let (resource_id_base, rest) = deserialize_into::<u32>(rest)?;
+        let (resource_id_mask, rest) = deserialize_into::<u32>(rest)?;
+        let (motion_buffer_size, rest) = deserialize_into::<u32>(rest)?;
+        let (vendor_length, rest) = deserialize_into::<u16>(rest)?;
+        let (maximum_request_length, rest) = deserialize_into::<u16>(rest)?;
+        let (number_of_screens, rest) = deserialize_into::<u8>(rest)?;
+        let (number_of_formats, rest) = deserialize_into::<u8>(rest)?;
+        let (image_byte_order, rest) = deserialize_into::<u8>(rest)?;
+        let (bitmap_bit_order, rest) = deserialize_into::<u8>(rest)?;
+        let (bitmap_scanline_unit, rest) = deserialize_into::<u8>(rest)?;
+        let (bitmap_scanline_pad, rest) = deserialize_into::<u8>(rest)?;
+        let (min_keycode, rest) = deserialize_into::<u8>(rest)?;
+        let (max_keycode, rest) = deserialize_into::<u8>(rest)?;
+        
+        // Trim the unused 4 bytes
+        let rest: &[u8] = &rest[4..];
+        let (vendor, rest) = deserialize_into_string(rest, vendor_length)?;
+
+        todo!()
     }
 }
 
 impl Stream {
-    /// Opens a connection using the Unix domain sockets or over TCP
+    /// Opens a connection to x11 server using the Unix domain sockets or over TCP.
+    ///
     /// Typically TCP connections are used for connecting to remote X11 server.
     /// So that we will first attempt to connect through Unix sockets.
     /// If that is unsuccessful, connect via TCP.
@@ -310,6 +425,7 @@ impl Stream {
         }
     }
 
+    /// Writes to the stream
     pub fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         if !self.open {
             return Err(std::io::Error::new(
@@ -323,6 +439,7 @@ impl Stream {
         }
     }
 
+    /// Reads from the stream
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if !self.open {
             return Err(std::io::Error::new(
@@ -337,20 +454,64 @@ impl Stream {
         }
     }
 
+    /// Moves this stream into or out of non-blocking mode.
+    pub fn set_nonblocking(&mut self, non_blocking: bool) -> std::io::Result<()> {
+        match self.variants {
+            StreamVariants::Tcp(ref mut stream) => stream.set_nonblocking(non_blocking),
+            StreamVariants::Unix(ref mut stream) => stream.set_nonblocking(non_blocking),
+        }
+    }
+
     /// Authenticate connection
-    pub fn authenticate(&self) {
+    pub fn authenticate(&mut self) {
         let xauth_entries = XAuthEntry::parse().unwrap();
 
         // Construct the ConnSetupRequest
         let setup_request = ConnSetupRequest::new(xauth_entries[0].clone());
 
-        let s = setup_request.serialize();
+        // Serialize the Setup Request
+        let sr = setup_request.serialize();
 
-        // println!("xauth entries: {:?}", xauth_entries);
+        // Write the Connection Setup Request to the stream
+        let mut written_count = 0;
+        while written_count < sr.len() {
+            match Self::write(self, &sr) {
+                Ok(c) => written_count += c,
+                Err(e) => {
+                    eprintln!("An error occurred: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
 
-        // TODO: Send Authorization Details: If required, send the length of the authorization
-        // protocol name and data, followed by the authorization protocol name (
-        // e.g., MIT-MAGIC-COOKIE-1) and the authorization data (e.g., the cookie).
+        println!("len: {}, written_count : {}", sr.len(), written_count);
+
+        // Read server's connection setup response from the stream
+        let mut buff = vec![0u8; 1000];
+
+        Self::set_nonblocking(self, true); // TODO: handle error
+
+        loop {
+            match Self::read(self, &mut buff) {
+                Ok(n) => {
+                    println!("Read {} bytes", n);
+                    break;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1000));
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("An error occurred: {}", e);
+                    process::exit(1);
+                } // Handle other errors
+            }
+        }
+
+        println!("read: {:?}", buff);
+
+        // TODO: deserialize the bytes to `ConnSetup`
+        let r = ConnSetup::parse_into(&buff);
 
         match self.variants {
             StreamVariants::Tcp(ref stream) => {
@@ -378,15 +539,12 @@ impl Connection {
         };
 
         // Opens a connection stream
-        let stream = Stream::open(display_name)?;
+        let mut stream = Stream::open(display_name)?;
 
-        // TODO: Authenticate
+        // Authenticate the connection
         stream.authenticate();
 
-        // Write
-
-        // Read
-
+        // TODO: This should be returned from the authenticate function
         Ok(Connection { stream })
     }
 }
