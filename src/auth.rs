@@ -1,4 +1,4 @@
-use super::connection::Family;
+use super::protocol::Family;
 use std::env::var_os;
 use std::fs::File;
 use std::io::{self, Read};
