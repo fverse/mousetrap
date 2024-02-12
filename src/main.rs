@@ -3,7 +3,7 @@ mod auth;
 mod byteorder;
 mod utils;
 mod errors;
-mod proto;
+mod protocol;
 
 use connection::Connection;
 
