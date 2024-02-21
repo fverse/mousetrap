@@ -11,7 +11,7 @@ use std::io::{self, Error, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
-use std::{env, mem, process, slice};
+use std::{env, process};
 
 /// Stream is a wrapper for the `UnixStream` and `TcpStream`.
 pub struct Stream {
@@ -73,13 +73,6 @@ impl ConnSetupRequest {
             authorization_protocol_data: entry.authorization_protocol_data,
             authorization_protocol_name: entry.authorization_protocol_name,
         }
-    }
-
-    /// Returns the raw bytes from a `ConnSetupRequest`
-    fn byte_raw_slice(v: &Self) -> &[u8] {
-        let p: *const Self = v;
-        let p: *const u8 = p as *const u8;
-        unsafe { slice::from_raw_parts(p, mem::size_of_val(v)) }
     }
 
     /// Converts an instance of `ConnSetupRequest` to x11 raw bytes
@@ -156,7 +149,7 @@ impl ConnSetup {
             Some(1) => {
                 // Connection established
                 // TODO: instead of unwrap, use ?
-                return Ok(Self::from_bytes(bytes).unwrap());
+                Ok(Self::from_bytes(bytes).map_err(|e| ConnectionError::from(e))?)
             }
             Some(2) => {
                 // Further authentication required
@@ -195,11 +188,16 @@ impl ConnSetup {
         // Trim the unused 4 bytes
         let rest: &[u8] = &rest[4..];
         let (vendor, rest) = deserialize_into_string(rest, vendor_length)?;
+        // let number_of_formats = 100000 as usize;
         // Trim the padding of vendor. p=pad(vendor)
         let rest = trim_by_padding(rest, vendor_length, 4);
-        let (pixmap_formats, rest) = deserialize_into_vec::<Format>(rest, number_of_formats)?;
+        let (pixmap_formats, rest) =
+            deserialize_into_vec::<Format>(rest, number_of_formats.into())?;
 
-        println!("pf: {:?}", pixmap_formats);
+        // println!("pf: {:?}", pixmap_formats);
+
+        
+
         todo!()
     }
 }
@@ -322,9 +320,13 @@ impl Stream {
             }
         }
 
-        println!("len: {}, written_count : {}", sr.len(), written_count);
+        // println!("len: {}, written_count : {}", sr.len(), written_count);
 
         // Read server's connection setup response from the stream
+        // TODO: The connection setup response wont have a fixed size. 
+        // Here i am reading a fixed number of bytes (for the purpose of quick bootstrapping), 
+        // which might end up in incomplete reads or reading data belonging to another field. 
+        // This should be fixed.
         let mut buff = vec![0u8; 1000];
 
         Self::set_nonblocking(self, true); // TODO: handle error
@@ -346,9 +348,9 @@ impl Stream {
             }
         }
 
-        println!("read: {:?}", buff);
+        // println!("read: {:?}", buff);
 
-        // TODO: deserialize the bytes to `ConnSetup`
+        // Deserialize the bytes to `ConnSetup`
         let r = ConnSetup::parse_into(&buff);
 
         match self.variants {
